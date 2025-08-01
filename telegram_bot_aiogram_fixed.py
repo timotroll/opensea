@@ -26,7 +26,7 @@ except Exception:
     PARSE_MODE_HTML = types.ParseMode.HTML  # type: ignore
     PARSE_MODE_MARKDOWN = types.ParseMode.MARKDOWN  # type: ignore
 
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 from run_top_collections_once import (
     OpenSeaClient,
@@ -136,6 +136,58 @@ admin_states: Dict[int, str] = {}
 
 # Глобальный экземпляр бота
 bot_instance: Optional[Bot] = None
+
+# -----------------------------------------------------------------------------
+# Control panel helpers
+#
+control_panel_messages: Dict[int, int] = {}
+
+
+def build_control_panel_text(uid: int) -> str:
+    cfg = user_settings[uid]
+    max_price_display = "∞" if cfg["price_max"] == float("inf") else f"{cfg['price_max']:.0f}"
+    monitoring = "🟢 Мониторинг включен" if cfg.get("monitoring") else "🔴 Мониторинг выключен"
+    return (
+        f"{monitoring}\n"
+        f"Страницы: {cfg['pages']}/{admin_settings['max_pages']}\n"
+        f"Диапазон цен: {cfg['price_min']:.0f}-{max_price_display}$\n"
+        f"Порог разрыва: {cfg['diff_max']:.2f}%\n"
+        f"Исключений: {len(cfg['excluded'])}"
+    )
+
+
+def build_control_panel_keyboard(uid: int) -> InlineKeyboardMarkup:
+    cfg = user_settings[uid]
+    buttons: List[List[InlineKeyboardButton]] = []
+    if cfg.get("monitoring"):
+        buttons.append([InlineKeyboardButton(text="⏹ Остановить", callback_data="monitor:stop")])
+    else:
+        buttons.append([InlineKeyboardButton(text="▶️ Запустить", callback_data="monitor:start")])
+    buttons.append([
+        InlineKeyboardButton(text="📄 Страницы", callback_data="set:pages"),
+        InlineKeyboardButton(text="💲 Цена", callback_data="set:price"),
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="📉 Разрыв", callback_data="set:diff"),
+    ])
+    if uid in ADMIN_IDS:
+        buttons.append([InlineKeyboardButton(text="⚙️ Админ", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_or_update_panel(uid: int, bot: Bot) -> None:
+    ensure_user_settings(uid)
+    text = build_control_panel_text(uid)
+    keyboard = build_control_panel_keyboard(uid)
+    msg_id = control_panel_messages.get(uid)
+    if msg_id:
+        try:
+            await bot.edit_message_text(text, uid, msg_id, reply_markup=keyboard)
+            return
+        except Exception:
+            pass
+    sent = await bot.send_message(uid, text, reply_markup=keyboard)
+    control_panel_messages[uid] = sent.message_id
 
 # -----------------------------------------------------------------------------
 # Helper Functions
@@ -425,6 +477,8 @@ async def start_monitoring(user_id: int) -> None:
     persist_user_settings(user_id)
     if monitor_task is None and bot_instance is not None:
         monitor_task = asyncio.create_task(global_monitor_loop(bot_instance))
+    if bot_instance is not None:
+        await send_or_update_panel(user_id, bot_instance)
 
 
 async def stop_monitoring(user_id: int) -> None:
@@ -434,6 +488,8 @@ async def stop_monitoring(user_id: int) -> None:
         return
     cfg["monitoring"] = False
     persist_user_settings(user_id)
+    if bot_instance is not None:
+        await send_or_update_panel(user_id, bot_instance)
 
 
 # -----------------------------------------------------------------------------
@@ -452,7 +508,7 @@ async def handle_start(message: types.Message) -> None:
     # Persist new user if needed
     c.execute("INSERT OR IGNORE INTO users(id) VALUES (?)", (uid,))
     conn.commit()
-    
+
     ensure_user_settings(uid)
     await message.answer(
         "Привет! Доступные команды:\n"
@@ -465,6 +521,7 @@ async def handle_start(message: types.Message) -> None:
         "`/monitor start|stop` — включить или выключить мониторинг.",
         parse_mode=None,
     )
+    await send_or_update_panel(uid, message.bot)
 
 
 @router.message(Command("settings"))
@@ -487,6 +544,16 @@ async def handle_settings_cmd(message: types.Message) -> None:
         f"Исключений: {excl_count}\n"
         f"Мониторинг: {monitoring}",
     )
+    await send_or_update_panel(uid, message.bot)
+
+
+@router.message(Command("menu"))
+async def handle_menu_cmd(message: types.Message) -> None:
+    uid = message.from_user.id
+    if uid not in allowed_users:
+        await message.reply("🚫 Нет доступа")
+        return
+    await send_or_update_panel(uid, message.bot)
 
 
 @router.message(Command("pages"))
@@ -514,6 +581,7 @@ async def handle_pages_cmd(message: types.Message) -> None:
     user_settings[uid]['pages'] = n
     persist_user_settings(uid)
     await message.reply(f"Количество страниц установлено на {n}.")
+    await send_or_update_panel(uid, message.bot)
 
 
 @router.message(Command("price"))
@@ -546,6 +614,7 @@ async def handle_price_cmd(message: types.Message) -> None:
         user_settings[uid]['price_max'] = max_val
     persist_user_settings(uid)
     await message.reply("Диапазон цен обновлён.")
+    await send_or_update_panel(uid, message.bot)
 
 
 @router.message(Command("diff"))
@@ -571,6 +640,7 @@ async def handle_diff_cmd(message: types.Message) -> None:
     user_settings[uid]['diff_max'] = val
     persist_user_settings(uid)
     await message.reply(f"Порог разрыва установлен на {val:.2f}%.")
+    await send_or_update_panel(uid, message.bot)
 
 
 @router.message(Command("exclude"))
@@ -593,11 +663,13 @@ async def handle_exclude_cmd(message: types.Message) -> None:
         user_settings[uid]['excluded'].add(slug)
         persist_user_settings(uid)
         await message.reply(f"Коллекция '{slug}' исключена.")
+        await send_or_update_panel(uid, message.bot)
         return
     if sub == "clear":
         user_settings[uid]['excluded'].clear()
         persist_user_settings(uid)
         await message.reply("Список исключений очищен.")
+        await send_or_update_panel(uid, message.bot)
         return
     if sub == "list":
         excl = user_settings[uid]['excluded']
@@ -624,17 +696,130 @@ async def handle_monitor_cmd(message: types.Message) -> None:
             f"Мониторинг сейчас {status}. Используйте `/monitor start` или `/monitor stop`.",
             parse_mode=PARSE_MODE_MARKDOWN,
         )
+        await send_or_update_panel(uid, message.bot)
         return
     sub = args[0].lower()
     if sub == "start":
-        await start_monitoring(uid)  # Исправлено: убрана передача bot
+        await start_monitoring(uid)
         await message.reply("Мониторинг запущен.")
+        await send_or_update_panel(uid, message.bot)
         return
     if sub == "stop":
         await stop_monitoring(uid)
         await message.reply("Мониторинг остановлен.")
+        await send_or_update_panel(uid, message.bot)
         return
     await message.reply("Неверная команда. Используйте start или stop.")
+
+
+@router.callback_query()
+async def handle_callbacks(query: CallbackQuery) -> None:
+    uid = query.from_user.id
+    if uid not in allowed_users:
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    data = query.data or ""
+    if data == "monitor:start":
+        await start_monitoring(uid)
+        await query.answer("Мониторинг запущен")
+        await send_or_update_panel(uid, query.message.bot)
+    elif data == "monitor:stop":
+        await stop_monitoring(uid)
+        await query.answer("Мониторинг остановлен")
+        await send_or_update_panel(uid, query.message.bot)
+    elif data == "set:pages":
+        user_settings[uid]['awaiting'] = "pages"
+        await query.message.answer("Введите количество страниц:")
+        await query.answer()
+    elif data == "set:price":
+        user_settings[uid]['awaiting'] = "price"
+        await query.message.answer("Введите диапазон цен <мин> <макс> (макс=0 без лимита):")
+        await query.answer()
+    elif data == "set:diff":
+        user_settings[uid]['awaiting'] = "diff"
+        await query.message.answer("Введите максимальный разрыв в %:")
+        await query.answer()
+    elif data == "admin:menu":
+        if uid in ADMIN_IDS:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📄 Лимит страниц", callback_data="admin:maxpages")],
+                [InlineKeyboardButton(text="👥 Список пользователей", callback_data="admin:listusers")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:back")],
+            ])
+            await query.message.edit_text("Админ-панель", reply_markup=kb)
+        await query.answer()
+    elif data == "admin:back":
+        await send_or_update_panel(uid, query.message.bot)
+        await query.answer()
+    elif data == "admin:maxpages":
+        if uid in ADMIN_IDS:
+            user_settings[uid]['awaiting'] = "admin_max_pages"
+            await query.message.answer("Введите новый лимит страниц:")
+        await query.answer()
+    elif data == "admin:listusers":
+        if uid in ADMIN_IDS:
+            c.execute("SELECT id FROM users")
+            rows = c.fetchall()
+            users = [str(r['id']) for r in rows] or ["Нет пользователей"]
+            await query.message.answer("Пользователи:\n" + "\n".join(users))
+        await query.answer()
+    else:
+        await query.answer()
+
+
+@router.message()
+async def handle_awaiting_input(message: types.Message) -> None:
+    uid = message.from_user.id
+    if uid not in allowed_users:
+        return
+    state = user_settings.get(uid, {}).get("awaiting")
+    if not state:
+        return
+    text = message.text or ""
+    try:
+        if state == "pages":
+            n = int(text)
+            n = max(1, min(n, admin_settings['max_pages']))
+            user_settings[uid]['pages'] = n
+            persist_user_settings(uid)
+            await message.reply(f"Количество страниц установлено на {n}.")
+        elif state == "price":
+            parts = text.split()
+            if len(parts) != 2:
+                raise ValueError
+            min_val = float(parts[0].replace(",", "."))
+            max_val = float(parts[1].replace(",", "."))
+            if min_val < 0:
+                raise ValueError
+            user_settings[uid]['price_min'] = min_val
+            user_settings[uid]['price_max'] = float('inf') if max_val <= 0 else max_val
+            persist_user_settings(uid)
+            await message.reply("Диапазон цен обновлён.")
+        elif state == "diff":
+            val = float(text.replace(",", "."))
+            if val <= 0:
+                raise ValueError
+            user_settings[uid]['diff_max'] = val
+            persist_user_settings(uid)
+            await message.reply(f"Порог разрыва установлен на {val:.2f}%.")
+        elif state == "admin_max_pages":
+            if uid not in ADMIN_IDS:
+                return
+            val = int(text)
+            val = max(1, min(val, MAX_PAGES_CODE))
+            admin_settings['max_pages'] = val
+            persist_admin_settings()
+            for u, cfg in user_settings.items():
+                if cfg['pages'] > val:
+                    cfg['pages'] = val
+                    persist_user_settings(u)
+            await message.reply(f"Новый лимит страниц: {val}.")
+        else:
+            return
+    except Exception:
+        await message.reply("Неверный ввод.")
+    user_settings[uid]['awaiting'] = None
+    await send_or_update_panel(uid, message.bot)
 
 
 @router.message(Command("help"))
@@ -785,7 +970,8 @@ async def handle_setmaxpages_cmd(message: types.Message) -> None:
 async def handle_text_auto_exclude(message: types.Message) -> None:
     """Auto-exclude collections from URLs"""
     uid = message.from_user.id
-    if uid not in allowed_users or not message.text or message.text.startswith("/"):
+    if (uid not in allowed_users or not message.text or message.text.startswith("/")
+            or user_settings.get(uid, {}).get("awaiting")):
         return
     ensure_user_settings(uid)
     slug = extract_slug(message.text)
@@ -793,6 +979,7 @@ async def handle_text_auto_exclude(message: types.Message) -> None:
         user_settings[uid]['excluded'].add(slug)
         persist_user_settings(uid)
         await message.reply(f"Коллекция '{slug}' добавлена в исключения.")
+        await send_or_update_panel(uid, message.bot)
 
 
 # -----------------------------------------------------------------------------
