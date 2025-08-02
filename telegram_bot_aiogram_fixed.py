@@ -1,5 +1,4 @@
 import os
-import re
 import asyncio
 import sqlite3
 import json
@@ -96,7 +95,6 @@ for row in c.fetchall():
         "diff_max": row["diff_max"],
         "excluded": set(json.loads(row["excluded"])),
         "monitoring": bool(row["monitoring"]),
-        "awaiting": None,
     }
 
 # Load admin settings
@@ -132,7 +130,6 @@ user_deal_messages: Dict[int, Dict[str, int]] = {}
 last_deal_data: Dict[int, Dict[str, Dict[str, Any]]] = {}
 last_deal_text: Dict[int, Dict[str, str]] = {}
 monitor_task: Optional[asyncio.Task] = None
-admin_states: Dict[int, str] = {}
 menu_messages: Dict[int, int] = {}
 
 # Глобальный экземпляр бота
@@ -233,58 +230,6 @@ async def refresh_menu_for_user(bot: Bot, uid: int) -> None:
     menu_messages[uid] = sent.message_id
 
 # -----------------------------------------------------------------------------
-# Control panel helpers
-#
-control_panel_messages: Dict[int, int] = {}
-
-
-def build_control_panel_text(uid: int) -> str:
-    cfg = user_settings[uid]
-    max_price_display = "∞" if cfg["price_max"] == float("inf") else f"{cfg['price_max']:.0f}"
-    monitoring = "🟢 Мониторинг включен" if cfg.get("monitoring") else "🔴 Мониторинг выключен"
-    return (
-        f"{monitoring}\n"
-        f"Страницы: {cfg['pages']}/{admin_settings['max_pages']}\n"
-        f"Диапазон цен: {cfg['price_min']:.0f}-{max_price_display}$\n"
-        f"Порог разрыва: {cfg['diff_max']:.2f}%\n"
-        f"Исключений: {len(cfg['excluded'])}"
-    )
-
-
-def build_control_panel_keyboard(uid: int) -> InlineKeyboardMarkup:
-    cfg = user_settings[uid]
-    buttons: List[List[InlineKeyboardButton]] = []
-    if cfg.get("monitoring"):
-        buttons.append([InlineKeyboardButton(text="⏹ Остановить", callback_data="monitor:stop")])
-    else:
-        buttons.append([InlineKeyboardButton(text="▶️ Запустить", callback_data="monitor:start")])
-    buttons.append([
-        InlineKeyboardButton(text="📄 Страницы", callback_data="set:pages"),
-        InlineKeyboardButton(text="💲 Цена", callback_data="set:price"),
-    ])
-    buttons.append([
-        InlineKeyboardButton(text="📉 Разрыв", callback_data="set:diff"),
-    ])
-    if uid in ADMIN_IDS:
-        buttons.append([InlineKeyboardButton(text="⚙️ Админ", callback_data="admin:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-async def send_or_update_panel(uid: int, bot: Bot) -> None:
-    ensure_user_settings(uid)
-    text = build_control_panel_text(uid)
-    keyboard = build_control_panel_keyboard(uid)
-    msg_id = control_panel_messages.get(uid)
-    if msg_id:
-        try:
-            await bot.edit_message_text(text, uid, msg_id, reply_markup=keyboard)
-            return
-        except Exception:
-            pass
-    sent = await bot.send_message(uid, text, reply_markup=keyboard)
-    control_panel_messages[uid] = sent.message_id
-
-# -----------------------------------------------------------------------------
 # Helper Functions
 #
 def ensure_user_settings(user_id: int) -> None:
@@ -297,7 +242,6 @@ def ensure_user_settings(user_id: int) -> None:
             "diff_max": 2.0,
             "excluded": set(),
             "monitoring": False,
-            "awaiting": None,
         }
         # Persist new settings to database
         persist_user_settings(user_id)
@@ -413,14 +357,15 @@ def format_deals(deals: List[Dict[str, Any]]) -> str:
         floor_str = f"{floor:.4f}" if isinstance(floor, (int, float)) else "?"
         offer_str = f"{offer:.4f}" if isinstance(offer, (int, float)) else "?"
         diff_str = f"{diff:.2f}" if isinstance(diff, (int, float)) else "?"
+        title = f"<a href='{link}'>{name}</a>" if link else name
         lines.append(
-            f"{i+1}. <a href='{link}'>{name}</a>\n"
+            f"{i+1}. {title}\n"
             f"   💵 Цена: ${price_str}\n"
             f"   🧾 Floor: {floor_str} ETH\n"
             f"   🤝 Offer: {offer_str} ETH\n"
-            f"   📉 Разрыв: {diff_str}%\n"
+            f"   📉 Разрыв: {diff_str}%"
         )
-    return "\n".join(lines)
+    return "\n\n".join(lines)
 
 
 def format_deal(deal: Dict[str, Any]) -> str:
@@ -446,14 +391,6 @@ def format_deal(deal: Dict[str, Any]) -> str:
         f"   🤝 Offer: {offer_str} ETH\n"
         f"   📉 Разрыв: {diff_str}%"
     )
-
-
-def extract_slug(text: str) -> Optional[str]:
-    """Extract slug from OpenSea URL"""
-    if not text:
-        return None
-    match = re.search(r"opensea\.io/collection/([\w\-]+)", text)
-    return match.group(1) if match else None
 
 
 # -----------------------------------------------------------------------------
@@ -520,12 +457,19 @@ async def global_monitor_loop(bot: Bot) -> None:
                 text = format_deal(deal)
                 # New deal
                 if key not in user_deal_messages[uid]:
+                    kb = None
+                    slug = deal.get("slug")
+                    if slug:
+                        kb = InlineKeyboardMarkup(
+                            inline_keyboard=[[InlineKeyboardButton("🚫 Исключить", callback_data=f"exclude:{slug}")]]
+                        )
                     try:
                         sent = await bot.send_message(
                             uid,
                             text,
                             parse_mode=PARSE_MODE_HTML,
                             disable_web_page_preview=True,
+                            reply_markup=kb,
                         )
                         user_deal_messages[uid][key] = sent.message_id
                         last_deal_data[uid][key] = deal
@@ -542,12 +486,19 @@ async def global_monitor_loop(bot: Bot) -> None:
 
                 message_id = user_deal_messages[uid][key]
                 try:
+                    kb = None
+                    slug = deal.get("slug")
+                    if slug:
+                        kb = InlineKeyboardMarkup(
+                            inline_keyboard=[[InlineKeyboardButton("🚫 Исключить", callback_data=f"exclude:{slug}")]]
+                        )
                     await bot.edit_message_text(
                         text,
                         chat_id=uid,
                         message_id=message_id,
                         parse_mode=PARSE_MODE_HTML,
                         disable_web_page_preview=True,
+                        reply_markup=kb,
                     )
                     last_deal_data[uid][key] = deal
                     last_deal_text[uid][key] = text
@@ -582,8 +533,6 @@ async def start_monitoring(user_id: int) -> None:
     persist_user_settings(user_id)
     if monitor_task is None and bot_instance is not None:
         monitor_task = asyncio.create_task(global_monitor_loop(bot_instance))
-    if bot_instance is not None:
-        await send_or_update_panel(user_id, bot_instance)
 
 
 async def stop_monitoring(user_id: int) -> None:
@@ -593,8 +542,6 @@ async def stop_monitoring(user_id: int) -> None:
         return
     cfg["monitoring"] = False
     persist_user_settings(user_id)
-    if bot_instance is not None:
-        await send_or_update_panel(user_id, bot_instance)
 
 
 # -----------------------------------------------------------------------------
@@ -653,62 +600,193 @@ async def cb_back_main(call: CallbackQuery) -> None:
 async def cb_set_pages(call: CallbackQuery) -> None:
     uid = call.from_user.id
     ensure_user_settings(uid)
-    user_settings[uid]["awaiting"] = "pages"
-    await call.message.answer(
-        f"Введите число страниц (1-{admin_settings['max_pages']}):"
-    )
+    buttons = [
+        [InlineKeyboardButton(str(i), callback_data=f"pages:{i}")]
+        for i in range(1, admin_settings["max_pages"] + 1)
+    ]
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await call.message.edit_text("Выберите количество страниц:", reply_markup=kb)
     await call.answer()
 
+@router.callback_query(F.data.startswith("pages:"))
+async def cb_pages_select(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    ensure_user_settings(uid)
+    n = int(call.data.split(":")[1])
+    user_settings[uid]["pages"] = n
+    persist_user_settings(uid)
+    await call.answer("Обновлено")
+    await call.message.delete()
+    await refresh_menu_for_user(call.message.bot, uid)
 
 @router.callback_query(F.data == "set_price")
 async def cb_set_price(call: CallbackQuery) -> None:
     uid = call.from_user.id
     ensure_user_settings(uid)
-    user_settings[uid]["awaiting"] = "price"
-    await call.message.answer("Введите мин и макс цену через пробел (макс=0 без лимита):")
+    values = [0, 50, 100, 200, 500, 1000]
+    buttons = [[InlineKeyboardButton(str(v), callback_data=f"price_min:{v}") for v in values]]
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await call.message.edit_text("Выберите минимальную цену ($):", reply_markup=kb)
     await call.answer()
 
+@router.callback_query(F.data.startswith("price_min:"))
+async def cb_price_min(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    ensure_user_settings(uid)
+    val = int(call.data.split(":")[1])
+    user_settings[uid]["price_min"] = val
+    values = [0, 50, 100, 200, 500, 1000, "∞"]
+    buttons = []
+    row = []
+    for v in values:
+        cb = "price_max:inf" if v == "∞" else f"price_max:{v}"
+        row.append(InlineKeyboardButton(str(v), callback_data=cb))
+    buttons.append(row)
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await call.message.edit_text("Выберите максимальную цену ($):", reply_markup=kb)
+    await call.answer()
 
+@router.callback_query(F.data.startswith("price_max:"))
+async def cb_price_max(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    ensure_user_settings(uid)
+    val = call.data.split(":")[1]
+    user_settings[uid]["price_max"] = float("inf") if val == "inf" else int(val)
+    persist_user_settings(uid)
+    await call.answer("Диапазон обновлён")
+    await call.message.delete()
+    await refresh_menu_for_user(call.message.bot, uid)
 @router.callback_query(F.data == "set_diff")
 async def cb_set_diff(call: CallbackQuery) -> None:
     uid = call.from_user.id
     ensure_user_settings(uid)
-    user_settings[uid]["awaiting"] = "diff"
-    await call.message.answer("Введите максимальный процент разрыва:")
+    options = [1, 2, 3, 5, 10]
+    buttons = [[InlineKeyboardButton(f"{v}%", callback_data=f"diff:{v}") for v in options]]
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await call.message.edit_text("Выберите максимальный разрыв:", reply_markup=kb)
     await call.answer()
 
-
+@router.callback_query(F.data.startswith("diff:"))
+async def cb_diff_select(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    ensure_user_settings(uid)
+    val = float(call.data.split(":")[1])
+    user_settings[uid]["diff_max"] = val
+    persist_user_settings(uid)
+    await call.answer("Порог обновлён")
+    await call.message.delete()
+    await refresh_menu_for_user(call.message.bot, uid)
 @router.callback_query(F.data == "set_excluded")
 async def cb_set_excluded(call: CallbackQuery) -> None:
     uid = call.from_user.id
     ensure_user_settings(uid)
-    user_settings[uid]["awaiting"] = "exclude"
-    await call.message.answer("Отправьте слаг коллекции для исключения или 'clear' для очистки:")
+    excluded = sorted(user_settings[uid]["excluded"])
+    buttons = [[InlineKeyboardButton(slug, callback_data=f"unexclude:{slug}")] for slug in excluded]
+    if excluded:
+        buttons.append([InlineKeyboardButton("🧹 Очистить", callback_data="clear_excluded")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    text = "Исключённые коллекции:" if excluded else "Исключённые коллекции: (пусто)"
+    await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
 
+@router.callback_query(F.data.startswith("unexclude:"))
+async def cb_unexclude(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    slug = call.data.split(":")[1]
+    ensure_user_settings(uid)
+    user_settings[uid]["excluded"].discard(slug)
+    persist_user_settings(uid)
+    await call.answer("Удалено")
+    await cb_set_excluded(call)
+    await refresh_menu_for_user(call.message.bot, uid)
 
+@router.callback_query(F.data == "clear_excluded")
+async def cb_clear_excluded(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    ensure_user_settings(uid)
+    user_settings[uid]["excluded"].clear()
+    persist_user_settings(uid)
+    await call.answer("Очищено")
+    await cb_set_excluded(call)
+    await refresh_menu_for_user(call.message.bot, uid)
+
+
+@router.callback_query(F.data.startswith("exclude:"))
+async def cb_exclude_from_deal(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    slug = call.data.split(":")[1]
+    ensure_user_settings(uid)
+    user_settings[uid]["excluded"].add(slug)
+    persist_user_settings(uid)
+    await call.answer("Добавлено в исключения")
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await refresh_menu_for_user(call.message.bot, uid)
 @router.callback_query(F.data == "admin_adduser")
 async def cb_admin_adduser(call: CallbackQuery) -> None:
     uid = call.from_user.id
     if uid not in ADMIN_IDS:
         await call.answer("Нет прав", show_alert=True)
         return
-    user_settings[uid]["awaiting"] = "admin_adduser"
-    await call.message.answer("Введите ID пользователя для добавления:")
+    c.execute("SELECT id FROM users")
+    all_users = {row["id"] for row in c.fetchall()}
+    candidates = sorted(all_users - allowed_users)
+    if not candidates:
+        await call.answer("Нет новых пользователей", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(str(u), callback_data=f"admin_adduser:{u}")] for u in candidates]
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await call.message.edit_text("Добавить пользователя:", reply_markup=kb)
     await call.answer()
 
-
+@router.callback_query(F.data.startswith("admin_adduser:"))
+async def cb_admin_adduser_select(call: CallbackQuery) -> None:
+    admin_id = call.from_user.id
+    if admin_id not in ADMIN_IDS:
+        await call.answer("Нет прав", show_alert=True)
+        return
+    user_id = int(call.data.split(":")[1])
+    allowed_users.add(user_id)
+    c.execute("INSERT OR IGNORE INTO users(id) VALUES (?)", (user_id,))
+    conn.commit()
+    await call.answer("Пользователь добавлен")
+    await call.message.delete()
+    await refresh_menu_for_user(call.message.bot, admin_id)
 @router.callback_query(F.data == "admin_removeuser")
 async def cb_admin_removeuser(call: CallbackQuery) -> None:
     uid = call.from_user.id
     if uid not in ADMIN_IDS:
         await call.answer("Нет прав", show_alert=True)
         return
-    user_settings[uid]["awaiting"] = "admin_removeuser"
-    await call.message.answer("Введите ID пользователя для удаления:")
+    removable = sorted(u for u in allowed_users if u not in ADMIN_IDS)
+    if not removable:
+        await call.answer("Некого удалять", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(str(u), callback_data=f"admin_removeuser:{u}")] for u in removable]
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await call.message.edit_text("Удалить пользователя:", reply_markup=kb)
     await call.answer()
 
-
+@router.callback_query(F.data.startswith("admin_removeuser:"))
+async def cb_admin_removeuser_select(call: CallbackQuery) -> None:
+    admin_id = call.from_user.id
+    if admin_id not in ADMIN_IDS:
+        await call.answer("Нет прав", show_alert=True)
+        return
+    user_id = int(call.data.split(":")[1])
+    allowed_users.discard(user_id)
+    await call.answer("Удалён")
+    await call.message.delete()
+    await refresh_menu_for_user(call.message.bot, admin_id)
 @router.callback_query(F.data == "admin_listusers")
 async def cb_admin_listusers(call: CallbackQuery) -> None:
     uid = call.from_user.id
@@ -719,7 +797,10 @@ async def cb_admin_listusers(call: CallbackQuery) -> None:
     rows = c.fetchall()
     users = [str(r["id"]) for r in rows]
     text = "Разрешённые пользователи:\n" + "\n".join(users) if users else "Нет пользователей"
-    await call.message.answer(text)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")]]
+    )
+    await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
 
 
@@ -729,662 +810,64 @@ async def cb_admin_setmaxpages(call: CallbackQuery) -> None:
     if uid not in ADMIN_IDS:
         await call.answer("Нет прав", show_alert=True)
         return
-    user_settings[uid]["awaiting"] = "admin_setmaxpages"
-    await call.message.answer(
-        f"Введите новый глобальный лимит страниц (1-{MAX_PAGES_CODE}):"
-    )
+    buttons = [[InlineKeyboardButton(str(i), callback_data=f"setmax:{i}")] for i in range(1, MAX_PAGES_CODE + 1)]
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await call.message.edit_text("Выберите глобальный лимит страниц:", reply_markup=kb)
     await call.answer()
+
+@router.callback_query(F.data.startswith("setmax:"))
+async def cb_admin_setmaxpages_select(call: CallbackQuery) -> None:
+    uid = call.from_user.id
+    if uid not in ADMIN_IDS:
+        await call.answer("Нет прав", show_alert=True)
+        return
+    value = int(call.data.split(":")[1])
+    admin_settings["max_pages"] = value
+    persist_admin_settings()
+    await call.answer("Обновлено")
+    await call.message.delete()
+    await refresh_menu_for_user(call.message.bot, uid)
+
+
+async def main() -> None:
+    """Run the bot"""
+    global bot_instance
+    bot_instance = Bot(BOT_TOKEN, parse_mode=PARSE_MODE_HTML)
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot_instance)
 
 
 # -----------------------------------------------------------------------------
 # Command Handlers
 #
+
+
 @router.message(Command("start"))
 async def handle_start(message: types.Message) -> None:
-    """Handle /start command"""
+    """Handle /start command and show intro"""
     uid = message.from_user.id
     if uid in ADMIN_IDS:
         allowed_users.add(uid)
     if uid not in allowed_users:
         await message.reply(
-            "🚫 У вас нет доступа. Попросите администратора добавить вас."
+            "🚫 У вас нет доступа. Попросите администратора добавить вас.",
         )
         return
 
-    # Persist new user if needed
     c.execute("INSERT OR IGNORE INTO users(id) VALUES (?)", (uid,))
     conn.commit()
-
     ensure_user_settings(uid)
 
-
-
-@router.message(Command("settings"))
-async def handle_settings_cmd(message: types.Message) -> None:
-    """Show current user settings"""
-    uid = message.from_user.id
-    if uid not in allowed_users:
-        await message.reply("🚫 Нет доступа")
-        return
-    ensure_user_settings(uid)
-    cfg = user_settings[uid]
-    max_price_display = "∞" if cfg['price_max'] == float('inf') else f"{cfg['price_max']:.0f}"
-    excl_count = len(cfg['excluded'])
-    monitoring = "включён" if cfg.get("monitoring") else "выключен"
-    await message.reply(
-        f"Настройки:\n"
-        f"Страницы: {cfg['pages']} из {admin_settings['max_pages']}\n"
-        f"Диапазон цен: {cfg['price_min']:.0f}-{max_price_display}$\n"
-        f"Порог разрыва: {cfg['diff_max']:.2f}%\n"
-        f"Исключений: {excl_count}\n"
-        f"Мониторинг: {monitoring}",
+    intro = (
+        "👋 <b>Добро пожаловать!</b>\n"
+        "Бот ищет выгодные сделки на OpenSea.\n"
+        "Используйте кнопки ниже для запуска мониторинга и настройки фильтров."
     )
-
-
-
-@router.message(Command("pages"))
-async def handle_pages_cmd(message: types.Message) -> None:
-    """Set number of pages to monitor"""
-    uid = message.from_user.id
-    if uid not in allowed_users:
-        await message.reply("🚫 Нет доступа")
-        return
-    ensure_user_settings(uid)
-    args = get_message_args(message).split()
-    if not args:
-        await message.reply(
-            f"Текущее количество страниц: {user_settings[uid]['pages']}."
-            f" Введите `/pages <N>`, где N от 1 до {admin_settings['max_pages']}.",
-            parse_mode=None,
-        )
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    try:
-        n = int(args[0])
-    except ValueError:
-        await message.reply("Неверный формат. Укажите число.")
-        return
-    n = max(1, min(n, admin_settings['max_pages']))
-    user_settings[uid]['pages'] = n
-    persist_user_settings(uid)
-    await message.reply(f"Количество страниц установлено на {n}.")
-
-
-
-@router.message(Command("price"))
-async def handle_price_cmd(message: types.Message) -> None:
-    """Set price range filter"""
-    uid = message.from_user.id
-    if uid not in allowed_users:
-        await message.reply("🚫 Нет доступа")
-        return
-    ensure_user_settings(uid)
-    args = get_message_args(message).split()
-    if len(args) < 2:
-        await message.reply(
-            "Использование: /price <мин> <макс>. Если макс = 0, ограничение отсутствует.", parse_mode=None
-        )
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    try:
-        min_val = float(args[0].replace(",", "."))
-        max_val = float(args[1].replace(",", "."))
-    except ValueError:
-        await message.reply("Неверный формат. Укажите два числа.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    if min_val < 0:
-        await message.reply("Минимальная цена не может быть отрицательной.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    user_settings[uid]['price_min'] = min_val
-    if max_val <= 0:
-        user_settings[uid]['price_max'] = float('inf')
-    else:
-        user_settings[uid]['price_max'] = max_val
-    persist_user_settings(uid)
-    await message.reply("Диапазон цен обновлён.")
-
-
-
-@router.message(Command("diff"))
-async def handle_diff_cmd(message: types.Message) -> None:
-    """Set max difference percentage"""
-    uid = message.from_user.id
-    if uid not in allowed_users:
-        await message.reply("🚫 Нет доступа")
-        return
-    ensure_user_settings(uid)
-    args = get_message_args(message).split()
-    if not args:
-        await message.reply("Использование: /diff <процент>.", parse_mode=None)
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    try:
-        val = float(args[0].replace(",", "."))
-    except ValueError:
-        await message.reply("Неверный формат. Укажите число.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    if val <= 0:
-        await message.reply("Порог должен быть положительным.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    user_settings[uid]['diff_max'] = val
-    persist_user_settings(uid)
-    await message.reply(f"Порог разрыва установлен на {val:.2f}%.")
-
-
-
-@router.message(Command("exclude"))
-async def handle_exclude_cmd(message: types.Message) -> None:
-    """Manage excluded collections"""
-    uid = message.from_user.id
-    if uid not in allowed_users:
-        await message.reply("🚫 Нет доступа")
-        return
-    ensure_user_settings(uid)
-    args = get_message_args(message).split()
-    if not args:
-        await message.reply(
-            "Использование: /exclude add <slug|url> или /exclude clear или /exclude list.", parse_mode=None
-        )
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    sub = args[0].lower()
-    if sub == "add" and len(args) >= 2:
-        slug = extract_slug(args[1]) or args[1]
-        user_settings[uid]['excluded'].add(slug)
-        persist_user_settings(uid)
-        await message.reply(f"Коллекция '{slug}' исключена.")
-
-        return
-    if sub == "clear":
-        user_settings[uid]['excluded'].clear()
-        persist_user_settings(uid)
-        await message.reply("Список исключений очищен.")
-
-        return
-    if sub == "list":
-        excl = user_settings[uid]['excluded']
-        if excl:
-            await message.reply("Исключены: " + ", ".join(excl))
-        else:
-            await message.reply("Список исключений пуст.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    await message.reply("Неверная команда исключения. Используйте add/clear/list.")
+    await message.answer(intro, parse_mode=PARSE_MODE_HTML)
     await refresh_menu_for_user(message.bot, uid)
-
-
-@router.message(Command("monitor"))
-async def handle_monitor_cmd(message: types.Message) -> None:
-    """Start/stop monitoring"""
-    uid = message.from_user.id
-    if uid not in allowed_users:
-        await message.reply("🚫 Нет доступа")
-        return
-    ensure_user_settings(uid)
-    args = get_message_args(message).split()
-    if not args:
-        status = "включён" if user_settings[uid].get("monitoring") else "выключен"
-        await message.reply(
-            f"Мониторинг сейчас {status}. Используйте `/monitor start` или `/monitor stop`.",
-            parse_mode=PARSE_MODE_MARKDOWN,
-        )
-
-        return
-    sub = args[0].lower()
-    if sub == "start":
-        await start_monitoring(uid)
-        await message.reply("Мониторинг запущен.")
-
-        return
-    if sub == "stop":
-        await stop_monitoring(uid)
-        await message.reply("Мониторинг остановлен.")
-
-        return
-    await message.reply("Неверная команда. Используйте start или stop.")
-    await refresh_menu_for_user(message.bot, uid)
-
-
-@router.callback_query()
-async def handle_callbacks(query: CallbackQuery) -> None:
-    uid = query.from_user.id
-    if uid not in allowed_users:
-        await query.answer("Нет доступа", show_alert=True)
-        return
-    data = query.data or ""
-    if data == "monitor:start":
-        await start_monitoring(uid)
-        await query.answer("Мониторинг запущен")
-        await send_or_update_panel(uid, query.message.bot)
-    elif data == "monitor:stop":
-        await stop_monitoring(uid)
-        await query.answer("Мониторинг остановлен")
-        await send_or_update_panel(uid, query.message.bot)
-    elif data == "set:pages":
-        user_settings[uid]['awaiting'] = "pages"
-        await query.message.answer("Введите количество страниц:")
-        await query.answer()
-    elif data == "set:price":
-        user_settings[uid]['awaiting'] = "price"
-        await query.message.answer("Введите диапазон цен <мин> <макс> (макс=0 без лимита):")
-        await query.answer()
-    elif data == "set:diff":
-        user_settings[uid]['awaiting'] = "diff"
-        await query.message.answer("Введите максимальный разрыв в %:")
-        await query.answer()
-    elif data == "admin:menu":
-        if uid in ADMIN_IDS:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📄 Лимит страниц", callback_data="admin:maxpages")],
-                [InlineKeyboardButton(text="👥 Список пользователей", callback_data="admin:listusers")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:back")],
-            ])
-            await query.message.edit_text("Админ-панель", reply_markup=kb)
-        await query.answer()
-    elif data == "admin:back":
-        await send_or_update_panel(uid, query.message.bot)
-        await query.answer()
-    elif data == "admin:maxpages":
-        if uid in ADMIN_IDS:
-            user_settings[uid]['awaiting'] = "admin_max_pages"
-            await query.message.answer("Введите новый лимит страниц:")
-        await query.answer()
-    elif data == "admin:listusers":
-        if uid in ADMIN_IDS:
-            c.execute("SELECT id FROM users")
-            rows = c.fetchall()
-            users = [str(r['id']) for r in rows] or ["Нет пользователей"]
-            await query.message.answer("Пользователи:\n" + "\n".join(users))
-        await query.answer()
-    else:
-        await query.answer()
-
-
-@router.message()
-async def handle_awaiting_input(message: types.Message) -> None:
-    uid = message.from_user.id
-    if uid not in allowed_users:
-        return
-    state = user_settings.get(uid, {}).get("awaiting")
-    if not state:
-        return
-    text = message.text or ""
-    try:
-        if state == "pages":
-            n = int(text)
-            n = max(1, min(n, admin_settings['max_pages']))
-            user_settings[uid]['pages'] = n
-            persist_user_settings(uid)
-            await message.reply(f"Количество страниц установлено на {n}.")
-        elif state == "price":
-            parts = text.split()
-            if len(parts) != 2:
-                raise ValueError
-            min_val = float(parts[0].replace(",", "."))
-            max_val = float(parts[1].replace(",", "."))
-            if min_val < 0:
-                raise ValueError
-            user_settings[uid]['price_min'] = min_val
-            user_settings[uid]['price_max'] = float('inf') if max_val <= 0 else max_val
-            persist_user_settings(uid)
-            await message.reply("Диапазон цен обновлён.")
-        elif state == "diff":
-            val = float(text.replace(",", "."))
-            if val <= 0:
-                raise ValueError
-            user_settings[uid]['diff_max'] = val
-            persist_user_settings(uid)
-            await message.reply(f"Порог разрыва установлен на {val:.2f}%.")
-        elif state == "admin_max_pages":
-            if uid not in ADMIN_IDS:
-                return
-            val = int(text)
-            val = max(1, min(val, MAX_PAGES_CODE))
-            admin_settings['max_pages'] = val
-            persist_admin_settings()
-            for u, cfg in user_settings.items():
-                if cfg['pages'] > val:
-                    cfg['pages'] = val
-                    persist_user_settings(u)
-            await message.reply(f"Новый лимит страниц: {val}.")
-        else:
-            return
-    except Exception:
-        await message.reply("Неверный ввод.")
-    user_settings[uid]['awaiting'] = None
-    await send_or_update_panel(uid, message.bot)
-
-
-@router.message(Command("help"))
-async def handle_help_cmd(message: types.Message) -> None:
-    """Show help information"""
-    uid = message.from_user.id
-    if uid in ADMIN_IDS:
-        text = (
-            "Доступные команды пользователя:\n"
-            "/pages <N> — установить число страниц.\n"
-            "/price <мин> <макс> — диапазон цен.\n"
-            "/diff <процент> — порог разрыва.\n"
-            "/exclude add|clear|list — управление исключениями.\n"
-            "/settings — показать ваши настройки.\n"
-            "/monitor start|stop — мониторинг.\n"
-            "\n"
-            "Команды администратора:\n"
-            "/adduser <id> — добавить пользователя.\n"
-            "/removeuser <id> — удалить пользователя.\n"
-            "/listusers — показать всех разрешённых пользователей.\n"
-            "/setmaxpages <N> — установить глобальный лимит страниц."
-        )
-    elif uid in allowed_users:
-        text = (
-            "Доступные команды пользователя:\n"
-            "/pages <N> — установить число страниц.\n"
-            "/price <мин> <макс> — диапазон цен.\n"
-            "/diff <процент> — порог разрыва.\n"
-            "/exclude add|clear|list — управление исключениями.\n"
-            "/settings — показать ваши настройки.\n"
-            "/monitor start|stop — мониторинг."
-        )
-    else:
-        await message.reply("🚫 У вас нет доступа.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    await message.reply(text, parse_mode=None)
-    await refresh_menu_for_user(message.bot, uid)
-
-
-@router.message(Command("adduser"))
-async def handle_adduser_cmd(message: types.Message) -> None:
-    """Add a new user (admin only)"""
-    uid = message.from_user.id
-    if uid not in ADMIN_IDS:
-        await message.reply("🚫 Нет прав администратора")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    args = get_message_args(message).split()
-    if not args:
-        await message.reply("Использование: /adduser <id>.", parse_mode=None)
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    try:
-        new_id = int(args[0])
-    except ValueError:
-        await message.reply("ID должен быть числом.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    
-    # Persist to DB
-    c.execute("INSERT OR IGNORE INTO users(id) VALUES (?)", (new_id,))
-    conn.commit()
-    
-    allowed_users.add(new_id)
-    ensure_user_settings(new_id)
-    await message.reply(f"Пользователь {new_id} добавлен.")
-    await refresh_menu_for_user(message.bot, uid)
-
-
-@router.message(Command("removeuser"))
-async def handle_removeuser_cmd(message: types.Message) -> None:
-    """Remove a user (admin only)"""
-    uid = message.from_user.id
-    if uid not in ADMIN_IDS:
-        await message.reply("🚫 Нет прав администратора")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    args = get_message_args(message).split()
-    if not args:
-        await message.reply("Использование: /removeuser <id>.", parse_mode=None)
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    try:
-        rem_id = int(args[0])
-    except ValueError:
-        await message.reply("ID должен быть числом.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    if rem_id in ADMIN_IDS:
-        await message.reply("Нельзя удалить администратора.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    
-    # Remove from DB
-    c.execute("DELETE FROM users WHERE id=?", (rem_id,))
-    c.execute("DELETE FROM user_settings WHERE user_id=?", (rem_id,))
-    conn.commit()
-    
-    allowed_users.discard(rem_id)
-    user_settings.pop(rem_id, None)
-    await stop_monitoring(rem_id)
-    await message.reply(f"Пользователь {rem_id} удалён.")
-    await refresh_menu_for_user(message.bot, uid)
-
-
-@router.message(Command("listusers"))
-async def handle_listusers_cmd(message: types.Message) -> None:
-    """List all allowed users (admin only)"""
-    uid = message.from_user.id
-    if uid not in ADMIN_IDS:
-        await message.reply("🚫 Нет прав администратора")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    
-    c.execute("SELECT id FROM users")
-    rows = c.fetchall()
-    users = [str(r["id"]) for r in rows]
-    
-    if not users:
-        await message.reply("Нет зарегистрированных пользователей.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-
-    await message.reply("Разрешённые пользователи:\n" + "\n".join(users))
-    await refresh_menu_for_user(message.bot, uid)
-
-
-@router.message(Command("setmaxpages"))
-async def handle_setmaxpages_cmd(message: types.Message) -> None:
-    """Set global page limit (admin only)"""
-    uid = message.from_user.id
-    if uid not in ADMIN_IDS:
-        await message.reply("🚫 Нет прав администратора")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    args = get_message_args(message).split()
-    if not args:
-        await message.reply(
-            f"Текущий лимит страниц: {admin_settings['max_pages']}. "
-            f"Использование: /setmaxpages <N>, где N ≤ {MAX_PAGES_CODE}. ({MAX_PAGES_CODE}00 коллекций)", parse_mode=None
-        )
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    try:
-        val = int(args[0])
-    except ValueError:
-        await message.reply("Введите число.")
-        await refresh_menu_for_user(message.bot, uid)
-        return
-    val = max(1, min(val, MAX_PAGES_CODE))
-    admin_settings['max_pages'] = val
-    persist_admin_settings()
-    
-    # Update users exceeding new max
-    for u, cfg in user_settings.items():
-        if cfg['pages'] > val:
-            cfg['pages'] = val
-            persist_user_settings(u)
-
-    await message.reply(f"Новый лимит страниц: {val}.")
-    await refresh_menu_for_user(message.bot, uid)
-
-
-@router.message()
-async def handle_text_auto_exclude(message: types.Message) -> None:
-    """Process free text inputs for awaiting states or auto-exclude"""
-    uid = message.from_user.id
-    if (uid not in allowed_users or not message.text or message.text.startswith("/")
-            or user_settings.get(uid, {}).get("awaiting")):
-        return
-    ensure_user_settings(uid)
-    cfg = user_settings[uid]
-    text = message.text.strip()
-    state = cfg.get("awaiting")
-
-    if state == "pages":
-        try:
-            n = int(text)
-            n = max(1, min(n, admin_settings["max_pages"]))
-            cfg["pages"] = n
-            persist_user_settings(uid)
-            await message.reply(f"Количество страниц установлено на {n}.")
-        except ValueError:
-            await message.reply("Неверный формат. Укажите число.")
-        cfg["awaiting"] = None
-        await refresh_menu_for_user(message.bot, uid)
-        return
-
-    if state == "price":
-        parts = text.replace(",", ".").split()
-        if len(parts) >= 2:
-            try:
-                min_val = float(parts[0])
-                max_val = float(parts[1])
-                if min_val < 0:
-                    await message.reply("Минимальная цена не может быть отрицательной.")
-                else:
-                    cfg["price_min"] = min_val
-                    cfg["price_max"] = float("inf") if max_val <= 0 else max_val
-                    persist_user_settings(uid)
-                    await message.reply("Диапазон цен обновлён.")
-            except ValueError:
-                await message.reply("Неверный формат. Укажите два числа.")
-        else:
-            await message.reply("Укажите два числа.")
-        cfg["awaiting"] = None
-        await refresh_menu_for_user(message.bot, uid)
-        return
-
-    if state == "diff":
-        try:
-            val = float(text.replace(",", "."))
-            if val <= 0:
-                await message.reply("Порог должен быть положительным.")
-            else:
-                cfg["diff_max"] = val
-                persist_user_settings(uid)
-                await message.reply(f"Порог разрыва установлен на {val:.2f}%.")
-        except ValueError:
-            await message.reply("Неверный формат. Укажите число.")
-        cfg["awaiting"] = None
-        await refresh_menu_for_user(message.bot, uid)
-        return
-
-    if state == "exclude":
-        if text.lower() == "clear":
-            cfg["excluded"].clear()
-            persist_user_settings(uid)
-            await message.reply("Список исключений очищен.")
-        else:
-            slug = extract_slug(text) or text
-            cfg["excluded"].add(slug)
-            persist_user_settings(uid)
-            await message.reply(f"Коллекция '{slug}' исключена.")
-        cfg["awaiting"] = None
-        await refresh_menu_for_user(message.bot, uid)
-        return
-
-    if state == "admin_adduser":
-        try:
-            new_id = int(text)
-            c.execute("INSERT OR IGNORE INTO users(id) VALUES (?)", (new_id,))
-            conn.commit()
-            allowed_users.add(new_id)
-            ensure_user_settings(new_id)
-            await message.reply(f"Пользователь {new_id} добавлен.")
-        except ValueError:
-            await message.reply("ID должен быть числом.")
-        cfg["awaiting"] = None
-        await refresh_menu_for_user(message.bot, uid)
-        return
-
-    if state == "admin_removeuser":
-        try:
-            rem_id = int(text)
-            if rem_id in ADMIN_IDS:
-                await message.reply("Нельзя удалить администратора.")
-            else:
-                c.execute("DELETE FROM users WHERE id=?", (rem_id,))
-                c.execute("DELETE FROM user_settings WHERE user_id=?", (rem_id,))
-                conn.commit()
-                allowed_users.discard(rem_id)
-                user_settings.pop(rem_id, None)
-                await stop_monitoring(rem_id)
-                await message.reply(f"Пользователь {rem_id} удалён.")
-        except ValueError:
-            await message.reply("ID должен быть числом.")
-        cfg["awaiting"] = None
-        await refresh_menu_for_user(message.bot, uid)
-        return
-
-    if state == "admin_setmaxpages":
-        try:
-            val = int(text)
-            val = max(1, min(val, MAX_PAGES_CODE))
-            admin_settings["max_pages"] = val
-            persist_admin_settings()
-            for u, cfg_u in user_settings.items():
-                if cfg_u["pages"] > val:
-                    cfg_u["pages"] = val
-                    persist_user_settings(u)
-            await message.reply(f"Новый лимит страниц: {val}.")
-        except ValueError:
-            await message.reply("Введите число.")
-        cfg["awaiting"] = None
-        await refresh_menu_for_user(message.bot, uid)
-        return
-
-    # Default auto-exclude behavior
-    slug = extract_slug(text)
-    if slug:
-        cfg["excluded"].add(slug)
-        persist_user_settings(uid)
-        await message.reply(f"Коллекция '{slug}' добавлена в исключения.")
-
-
-
-# -----------------------------------------------------------------------------
-# Main Bot Setup
-#
-def main() -> None:
-    global bot_instance  # Добавлено для доступа к глобальной переменной
-    
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        raise RuntimeError(
-            "Please set your Telegram bot token via the TELEGRAM_BOT_TOKEN environment "
-            "variable or replace BOT_TOKEN in telegram_bot_aiogram.py."
-        )
-    
-    # Create bot instance
-    try:
-        from aiogram.client.bot import DefaultBotProperties  # type: ignore
-        bot_instance = Bot(  # Исправлено: сохраняем в глобальную переменную
-            token=BOT_TOKEN,
-            default=DefaultBotProperties(parse_mode=PARSE_MODE_HTML),
-        )
-    except Exception:
-        bot_instance = Bot(token=BOT_TOKEN, parse_mode=PARSE_MODE_HTML)
-    
-    # Create dispatcher
-    dp = Dispatcher()
-    dp.startup.register(lambda *args, **kwargs: print("Aiogram bot started"))
-    dp.include_router(router)
-
-    # Start polling
-    asyncio.run(dp.start_polling(bot_instance))  # Исправлено: передаем bot_instance
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
