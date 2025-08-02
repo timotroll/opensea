@@ -866,6 +866,9 @@ async def main() -> None:
     elapsed = time.monotonic() - start_time
     logger.info(f"Elapsed time: {elapsed:.2f} seconds")
     # Write out the results
+    with open("output.json", "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    logger.info("Saved %d collections to output.json", len(results))
 
 if __name__ == "__main__":
     asyncio.run(main())
